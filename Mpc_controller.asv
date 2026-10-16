@@ -1,0 +1,85 @@
+function [u_opt, U_opt, J_opt] = Mpc_controller(x, W, theta_hat, P, U_warm)
+% MPC_CONTROLLER  Linear MPC via fmincon.
+
+    %% ---------- Setup ----------
+    N  = P.N;
+    nx = 5;
+    nu = 3;
+
+    x         = x(:);
+    theta_hat = theta_hat(:);
+
+    u_nom = zeros(nu, 1);
+    [~, A, B] = uav_dynamics(x, u_nom, P.dt, P, theta_hat);
+
+    X_nom = zeros(nx, N+1);
+    X_nom(:,1) = x;
+    for j = 1:N
+        X_nom(:,j+1) = A * X_nom(:,j);
+    end
+
+    %% ---------- Sensitivity matrices ----------
+    Phi   = zeros(nx*(N+1), nx);
+    Gamma = zeros(nx*(N+1), nu*N);
+    Phi(1:nx, :) = eye(nx);
+
+    for j = 1:N
+        rows = (j*nx+1):((j+1)*nx);
+        prev = ((j-1)*nx+1):(j*nx);
+        cols = ((j-1)*nu+1):(j*nu);
+
+        Phi(rows, :)   = A * Phi(prev, :);
+        Gamma(rows, :) = A * Gamma(prev, :);
+        Gamma(rows, cols) = Gamma(rows, cols) + B;
+    end
+
+    %% ---------- Quadratic cost ----------
+    Q_run  = diag([0, 0, 0, P.w1, P.w3]);
+    R_run  = diag([0, P.w1, P.w2]);
+    Q_term = diag([P.w4, P.w4, 0, 0, P.w5]);
+
+    Qbar = blkdiag(kron(eye(N), Q_run), Q_term);
+    Rbar = kron(eye(N), R_run);
+
+    H = 2 * (Gamma' * Qbar * Gamma + Rbar);
+    H = (H + H') / 2 + 1e-4 * eye(size(H));
+
+    g = 2 * Gamma' * Qbar * (Phi * x);
+
+    %% ---------- Treatment cost (only linear term added) ----------
+    for j = 1:N
+        s_idx = (j-1)*nu + 3;
+        Wq = interp2(W, X_nom(1,j), X_nom(2,j), 'linear', 0);
+        if isnan(Wq), Wq = 0; end
+        g(s_idx) = g(s_idx) + P.w2 * (1 - Wq);
+    end
+
+    %% ---------- Bounds ----------
+    lb = repmat([-P.a_max; -P.w_max; 0], N, 1);
+    ub = repmat([ P.a_max;  P.w_max; 1], N, 1);
+
+    %% ---------- Solve ----------
+    Jfun = @(U) 0.5 * U' * H * U + g' * U;
+
+    if ~isempty(U_warm) && numel(U_warm) == nu*N
+        U0 = U_warm;
+    else
+        U0 = zeros(nu*N, 1);
+    end
+
+    opts = optimoptions('fmincon', ...
+        'Algorithm',                'sqp', ...
+        'Display',                  'off', ...
+        'MaxIterations',            20, ...
+        'OptimalityTolerance',      1e-3, ...
+        'StepTolerance',            1e-6);
+
+    [U_opt, J_opt, exitflag] = fmincon(Jfun, U0, [], [], [], [], lb, ub, [], opts);
+
+    if exitflag <= 0
+        U_opt = U0;
+        J_opt = 0.5 * U0' * H * U0 + g' * U0;
+    end
+
+    u_opt = U_opt(1:nu);
+end
